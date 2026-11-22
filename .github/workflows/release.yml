@@ -32,26 +32,26 @@ jobs:
 
       - name: Build executable
         run: |
-          python -m PyInstaller --onefile --windowed --name "Generate 3D Mesh" --add-data "static;static" --collect-submodules uvicorn run.py
+          python -m PyInstaller --onefile --windowed --name "Generate 3D Face Mesh" --add-data "static;static" --collect-submodules uvicorn run.py
 
       - name: Package release zip
         shell: pwsh
         run: |
-          $zipName = "Generate-3D-Mesh-${{ inputs.version }}-windows-x64.zip"
-          Compress-Archive -Path "dist\Generate 3D Mesh.exe", "README.md" -DestinationPath $zipName -Force
+          $zipName = "Generate-3D-Face-Mesh-${{ inputs.version }}-windows-x64.zip"
+          Compress-Archive -Path "dist\Generate 3D Face Mesh.exe", "README.md" -DestinationPath $zipName -Force
           echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2.3.2
         with:
           tag_name: ${{ inputs.version }}
-          name: "Generate 3D Mesh ${{ inputs.version }}"
+          name: "Generate 3D Face Mesh ${{ inputs.version }}"
           body: |
-            ## Generate 3D Mesh ${{ inputs.version }}
+            ## Generate 3D Face Mesh ${{ inputs.version }}
 
             ### Installation
-            1. Download `Generate-3D-Mesh-${{ inputs.version }}-windows-x64.zip`
-            2. Extract and run `Generate 3D Mesh.exe` — no installation required.
+            1. Download `Generate-3D-Face-Mesh-${{ inputs.version }}-windows-x64.zip`
+            2. Extract and run `Generate 3D Face Mesh.exe` — no installation required.
 
             ### Requirements
             - Windows 10/11 x64
