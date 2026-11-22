@@ -3,16 +3,23 @@
 You look at the camera and move your head around; the page tracks your face (MediaPipe, in the browser) and sends the best photo for
 each head angle here. The server blends them into one seamless skin texture and writes everything for one person into output/<name>/:
 
-    photos/*.jpg          the best photo for each pose, with its measured head angle in photos.json
-    skin_atlas.json       the mesh layout (landmarks, triangles, texture coordinates) and the front-facing 3D landmarks
-    skin_stitched.png     the blended skin texture (2048 px)
-    mesh.obj / mesh.mtl   the face as an OBJ model that uses that texture (open it in Blender, MeshLab, Windows 3D Viewer...)
+    profile.json          the name as typed (the folder is the lowercase name: "Jeff Molofee" -> jeff_molofee)
+    photos/               the best photo for each pose, with its measured head angle in photos/photos.json
+    mesh/                 the 3D model and everything needed to load and view it:
+        mesh.obj, mesh.mtl  the face as an OBJ model (open it in Blender, MeshLab, Windows 3D Viewer...)
+        skin.png            its texture map (the blended skin, 2048 px)
+        mesh.json           the same mesh as plain data (vertices, uvs, triangles), used by the in-app viewer
+        skin_atlas.json     the mesh layout (landmarks, triangles, texture coordinates) the model is built from
+        preview.jpg         a small picture of the skin
+Saving a scan builds the whole mesh folder automatically.
 """
 from __future__ import annotations
 
 import base64
 import json
 import re
+import shutil
+import sys
 from pathlib import Path
 from uuid import uuid4
 
@@ -23,16 +30,33 @@ from pydantic import BaseModel
 
 from app import export, skin_live
 
-ROOT = Path(__file__).resolve().parent.parent
-OUT = ROOT / "output"
+if getattr(sys, "frozen", False):  # packaged .exe: bundled files live in the temp unpack dir, output goes next to the .exe
+    ROOT = Path(sys._MEIPASS)
+    OUT = Path(sys.executable).resolve().parent / "output"
+else:
+    ROOT = Path(__file__).resolve().parent.parent
+    OUT = ROOT / "output"
 STATIC = ROOT / "static"
 app = FastAPI(title="Generate 3D Mesh")
 
 
+def slug(name: str) -> str:
+    """'Jeff Molofee' -> 'jeff_molofee'"""
+    return re.sub(r"[^a-z0-9_-]+", "_", name.strip().lower()).strip("_") or "face"
+
+
+def mesh_dir(name: str) -> Path:
+    d = folder(name) / "mesh"
+    d.mkdir(exist_ok=True)
+    return d
+
+
 def folder(name: str) -> Path:
-    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", name.strip()).strip("_") or "face"
-    d = OUT / safe
+    d = OUT / slug(name)
     d.mkdir(parents=True, exist_ok=True)
+    prof = d / "profile.json"
+    if not prof.exists():
+        prof.write_text(json.dumps({"name": name.strip()}), encoding="utf-8")
     return d
 
 
@@ -67,9 +91,26 @@ class Atlas(BaseModel):
     layout: dict
 
 
+class ProfileDelete(BaseModel):
+    canonical_name: str
+
+
+@app.post("/api/profile/delete")
+def delete_profile(b: ProfileDelete) -> dict:
+    d = OUT / slug(b.canonical_name)
+    out_root = OUT.resolve()
+    resolved = d.resolve()
+    if resolved.parent != out_root or not resolved.is_dir():
+        return {"status": "not_found"}
+    shutil.rmtree(resolved)
+    skin_live.SESSIONS.pop(b.canonical_name, None)
+    skin_live.SESSIONS.pop(slug(b.canonical_name), None)
+    return {"status": "ok"}
+
+
 @app.post("/api/stitch/start")
 def stitch_start(b: StitchStart) -> dict:
-    (folder(b.canonical_name) / "skin_atlas.json").write_text(json.dumps(b.layout), encoding="utf-8")
+    (mesh_dir(b.canonical_name) / "skin_atlas.json").write_text(json.dumps(b.layout), encoding="utf-8")
     return skin_live.start(b.canonical_name, b.layout)
 
 
@@ -94,10 +135,14 @@ def stitch_preview(canonical_name: str, tone: str = "") -> Response:
 
 @app.post("/api/stitch/finish")
 def stitch_finish(b: StitchFinish) -> dict:
-    d = folder(b.canonical_name)
-    out = skin_live.finish(b.canonical_name, d, b.tone)
+    m = mesh_dir(b.canonical_name)
+    out = skin_live.finish(b.canonical_name, m, b.tone)
     if out.get("status") == "ok":
-        out["url"] = f"/output/{d.name}/skin_stitched.png"
+        out["url"] = f"/output/{m.parent.name}/mesh/skin.png"
+        try:  # saving the scan also builds the 3D model, so the mesh folder is complete straight away
+            out["mesh"] = export.write_obj(m)
+        except Exception as exc:  # noqa: BLE001
+            out["mesh_error"] = f"{type(exc).__name__}: {exc}"
     return out
 
 
@@ -120,26 +165,30 @@ def scan_frames(b: Frames) -> dict:
         name = f"angle_{int(f.get('angle_index', 0))}_{uuid4().hex[:6]}.jpg"
         (d / name).write_bytes(_b64(f["image_base64"]))
         rows.append({"file": name, **{k: f.get(k) for k in ("caption", "angle_index", "quality_score", "yaw_deg", "pitch_deg")}})
-    (d.parent / "photos.json").write_text(json.dumps(rows, indent=1), encoding="utf-8")
+    (d / "photos.json").write_text(json.dumps(rows, indent=1), encoding="utf-8")
     return {"status": "ok", "photos": len(rows), "profile": {"photos": len(rows)}}
 
 
 @app.post("/api/capture/skin-atlas")
 def skin_atlas(b: Atlas) -> dict:
-    d = folder(b.canonical_name)
-    (d / "skin_atlas.png").write_bytes(_b64(b.atlas_base64))
+    d = mesh_dir(b.canonical_name)
     (d / "skin_atlas.json").write_text(json.dumps(b.layout), encoding="utf-8")
     return {"status": "ok"}
 
 
-@app.post("/api/mesh/export")
-def mesh_export(b: StitchFinish) -> dict:
-    d = folder(b.canonical_name)
-    try:
-        info = export.write_obj(d)
-    except Exception as exc:  # noqa: BLE001
-        return {"status": "error", "message": f"{type(exc).__name__}: {exc}"}
-    return {"status": "ok", "folder": str(d), "obj": f"/output/{d.name}/mesh.obj", **info}
+@app.get("/api/users")
+def users() -> list[dict]:
+    rows = []
+    for d in sorted(OUT.iterdir()) if OUT.exists() else []:
+        if not d.is_dir():
+            continue
+        try:
+            name = json.loads((d / "profile.json").read_text(encoding="utf-8")).get("name") or d.name
+        except (OSError, ValueError):
+            name = d.name.replace("_", " ").title()
+        rows.append({"name": name, "folder": d.name, "has_scan": (d / "photos" / "photos.json").exists(),
+                     "has_mesh": (d / "mesh" / "mesh.obj").exists() and (d / "mesh" / "mesh.json").exists()})
+    return rows
 
 
 @app.get("/")

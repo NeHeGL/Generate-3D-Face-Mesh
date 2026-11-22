@@ -31,7 +31,11 @@ def layout_context(layout: dict, S: int) -> dict:
             cen = canon[[a, b, c]].mean(axis=0)
             if np.hypot(*(cen - canon[98])) < r or np.hypot(*(cen - canon[327])) < r:
                 cv2.fillConvexPoly(nostril, np.round(canon[[a, b, c]]).astype(np.int32), 255)
-    return dict(S=S, canon=canon, tris=tris, N=N, n_real=n_real, centres=centres, sign0=sign0, mesh_mask=mesh_mask, nostril=nostril)
+    # Around the nostrils the triangles are tiny and rounding to pixels leaves pinhole gaps between them: close those gaps there only.
+    zone = cv2.dilate(nostril, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (int(S / 40) | 1, int(S / 40) | 1)))
+    closed = cv2.morphologyEx(mesh_mask, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    mesh_mask = np.where(zone > 0, closed, mesh_mask).astype(np.uint8)
+    return dict(S=S, zone=zone, canon=canon, tris=tris, N=N, n_real=n_real, centres=centres, sign0=sign0, mesh_mask=mesh_mask, nostril=nostril)
 
 
 def prepare_photo(img: np.ndarray, lm_norm, ctx: dict):
@@ -87,7 +91,7 @@ def prepare_photo(img: np.ndarray, lm_norm, ctx: dict):
     atlas = np.zeros((S, S, 3), np.float32)
     wmap = np.zeros((S, S), np.float32)
     for i, (a, b, c) in enumerate(tris):
-        if not (front[i] and visible[i]) or facing[i] < 0.22:
+        if not (front[i] and visible[i]) or facing[i] < 0.08:
             continue
         dst = canon[[a, b, c]]
         src = P[[a, b, c], :2]
@@ -105,5 +109,6 @@ def prepare_photo(img: np.ndarray, lm_norm, ctx: dict):
         cv2.fillConvexPoly(tmask, np.round(grown).astype(np.int32), 255)
         sel = tmask > 0
         atlas[by0:by1, bx0:bx1][sel] = warped[sel]
-        wmap[by0:by1, bx0:bx1][sel] = float(facing[i] ** 4)  # the most front-on photo of each patch dominates
+        wmap[by0:by1, bx0:bx1][sel] = float(facing[i] ** 2.5)  # front-on photos dominate, but side views still contribute (nose flanks, cheeks)
+    wmap = cv2.GaussianBlur(wmap, (0, 0), 0.8 * S / 1024 + 0.3)  # feathered edges: no hard cut-offs between photos
     return {"atlas": atlas, "w": wmap, "yaw": float(P[1, 0] - P[[33, 263], 0].mean()), "sharp": sharp}

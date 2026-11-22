@@ -10,6 +10,7 @@ import { estimateHeadPose, scoreCapture } from "/static/face-pose.js?v=25";
 
 const CAPTURE_PX = 640;
 const SCAN_WIDE = 1.5; // saved scan photos include hair, ears and neck around the on-screen circle
+const DISPLAY_WIDE = 1; // how much of that saved area the camera window shows: 1 = just the circle (a tight crop on your face, like the mask); 1.5 = the whole saved area
 const FRONTAL_PX = 1024;
 const FACE_PX_GOOD = 200; // the saved photos are cropped and enlarged around your face, so what counts is how many camera pixels it covers, not how big it looks
 const BASELINE_FRAMES = 20;
@@ -18,12 +19,12 @@ const FRONTAL_INDEX = 100; // hero photo slot; grid cells use 0..44
 const RAD = 180 / Math.PI;
 const DONE_AT = 60; // % accuracy before "Done" unlocks
 
-const YAWS = [-36, -27, -18, -9, 0, 9, 18, 27, 36];
+const YAWS = [-40, -30, -20, -10, 0, 10, 20, 30, 40]; // degrees of real head turn the outer columns stand for (the sides of the face need real turns)
 const PITCHES = [16, 8, 0, -8, -16]; // top row = looking up (small range: big tilts are hard and the tracker loses you)
-const YAW_TOL = 6;
+const YAW_TOL = 6.5;
 const PITCH_TOL = 5.5;
 const CELLS = [];
-PITCHES.forEach((p, r) => YAWS.forEach((y, c) => CELLS.push({ yaw: y, pitch: p, r, c, w: 1 - 0.35 * Math.hypot(y / 36, p / 16) / Math.SQRT2 })));
+PITCHES.forEach((p, r) => YAWS.forEach((y, c) => CELLS.push({ yaw: y, pitch: p, r, c, w: 1 - 0.35 * Math.hypot(y / 40, p / 16) / Math.SQRT2 })));
 
 const store = {
   get: (k, fallback = false) => {
@@ -141,7 +142,7 @@ export async function runFaceScan(root, canonicalName, api) {
   };
   let liveParts = null; // size / steadiness / centring of the frame on screen right now
   let recenter = null; // frames still to average after the Re-center button
-  const baseline = { yaw: 0, pitch: 0, n: 0, sy: 0, sp: 0, ready: false };
+  const baseline = { yaw: 0, pitch: 0, n: 0, sy: 0, sp: 0, ready: false, lmSum: null }; // lmSum: running sum of the landmarks over the calibration frames
   const slots = Array(CELLS.length).fill(null);
 
   const wrap = document.createElement("section");
@@ -172,6 +173,10 @@ export async function runFaceScan(root, canonicalName, api) {
     </div>
   `;
   const video = wrap.querySelector("#scan-video");
+  // The Re-center button lives in the page's footer line, bottom-left, on the same row as the credit text (the empty #hw-mode slot).
+  const recenterBtn = wrap.querySelector("#scan-recenter");
+  const footerSlot = document.getElementById("hw-mode");
+  if (recenterBtn && footerSlot) { footerSlot.innerHTML = ""; recenterBtn.style.cssText = "margin:0;padding:0.3rem 0.9rem;font-size:0.85rem"; footerSlot.appendChild(recenterBtn); }
   const videoWrap = wrap.querySelector("#scan-video-wrap");
   const hint = wrap.querySelector("#scan-hint");
   const liveEl = wrap.querySelector("#scan-live");
@@ -212,6 +217,9 @@ export async function runFaceScan(root, canonicalName, api) {
     grid.appendChild(row);
   });
   let activeCell = -1;
+  let needsCell = []; // per square: still circled (needs work)
+  const Q_TARGET = 0.85; // photo quality that counts as 100% (quality is 0..1; see the formula where photos are scored)
+  const cellPct = (i) => (slots[i] ? Math.min(1, slots[i].quality / Q_TARGET) : 0);
 
   /** 0..100: weighted coverage by quality, with partial credit from neighbouring cells (corners are hard to reach). */
   function accuracy() {
@@ -259,14 +267,6 @@ export async function runFaceScan(root, canonicalName, api) {
     return `Skin tone: in the natural range ${tag}.`;
   }
 
-  /** Position on the steep scale: 1 = as good as your best (green), 0 = clearly weak (red). 90%+ stays green, 75% is yellow, 60% is red. */
-  const steep = (rel) => Math.max(0, Math.min(1, (rel - 0.6) / 0.3));
-  const percentile90 = (arr) => {
-    if (!arr.length) return 1;
-    const a = arr.slice().sort((x, y) => x - y);
-    return Math.max(1e-6, a[Math.floor(0.9 * (a.length - 1))]);
-  };
-
   /** Plain-language reasons for the accuracy number: which ingredient of the photos is holding it down. */
   function qualitySummary() {
     const have = slots.filter((x) => x && x.parts);
@@ -286,7 +286,7 @@ export async function runFaceScan(root, canonicalName, api) {
     else if (worst === stab) advice = "Hold still for half a second at each position";
     else advice = "Keep your face in the middle of the view";
     return [
-      ["Face width", `${Math.round(faceW)} px (${FACE_PX_GOOD}+ is plenty)`],
+      ["Face width", `${Math.round(faceW)} px of a ${video.videoWidth || "?"}×${video.videoHeight || "?"} camera picture (${FACE_PX_GOOD}+ is plenty)`],
       ["Steadiness", `${pct(stab)}%`],
       ["Centring", `${pct(centre)}%`],
       ...toneRow,
@@ -298,23 +298,14 @@ export async function runFaceScan(root, canonicalName, api) {
     const acc = accuracy();
     accFill.style.width = `${acc}%`;
     accText.textContent = `Scan accuracy: ${acc}% · skin mapped: ${stitchCoverage ?? paintedPercent()}% · colour consistency: ${colourMatchPercent()}%`;
-    const qRef = percentile90(slots.filter(Boolean).map((x) => x.quality));
-    // Which squares are "odd ducks"? Compare every square with the best one. Start by flagging anything under 90% of the
-    // best (and every empty square). When none are left, tighten to 97%, then to 99.5%, so the weakest squares keep getting
-    // flagged until every square is level with the best.
-    const have = slots.filter(Boolean).map((x) => x.quality);
-    const qBest = have.length ? Math.max(...have) : 1;
-    const empties = slots.filter((x) => !x).length;
-    const countBelow = (limit) => have.filter((q) => q / qBest < limit).length;
-    let thr = 0.9;
-    if (empties === 0 && countBelow(0.9) === 0) thr = 0.97;
-    if (empties === 0 && countBelow(0.9) === 0 && countBelow(0.97) === 0) thr = 0.995;
+    // Every square is scored against a FIXED target (a good, sharp, well-centred photo taken at the middle of the square), never against
+    // the other squares. So a square that reaches 100% stays at 100%, and only squares below 100% are circled.
     cellEls.forEach((el, i) => {
-      const q = slots[i] ? slots[i].quality : 0;
-      const g = slots[i] ? steep(q / qRef) : 0;
-      el.style.background = slots[i] ? `hsl(${Math.round(g * 120)}, 70%, 38%)` : "rgba(200, 55, 45, 0.45)";
-      // Squares that still need work blink with a white outline; finished squares fade back.
-      const needs = !slots[i] || (slots[i].quality / qBest < thr);
+      const pct = cellPct(i);
+      const needs = pct < 1;
+      needsCell[i] = needs;
+      // Pure green is reserved for 100%; anything less shades from red towards yellow-green.
+      el.style.background = !slots[i] ? "rgba(200, 55, 45, 0.45)" : `hsl(${pct >= 1 ? 120 : Math.round(100 * pct)}, 70%, 38%)`;
       el.classList.toggle("need-work", needs);
       el.classList.toggle("dim", !needs);
       el.classList.toggle("active", i === activeCell);
@@ -324,7 +315,7 @@ export async function runFaceScan(root, canonicalName, api) {
     if (!framing?.isModelReady) hint.textContent = "Loading face tracking (the first time takes 10–20 s)…";
     else if (!baseline.ready) hint.textContent = "Look straight at the camera and hold still for a moment…";
     else if (acc < DONE_AT)
-      hint.textContent = "Sit close (your face should fill about half the view), keep even light on your face, and move your head slowly — pausing half a second at each extreme.";
+      hint.textContent = "Sit close, keep even light on your face, and move your head slowly, pausing half a second at each extreme.";
     else if (acc < 85) hint.textContent = "Good. Keep moving to fill the remaining dots.";
     else hint.textContent = "Excellent coverage.";
     return acc;
@@ -407,7 +398,7 @@ export async function runFaceScan(root, canonicalName, api) {
     return [a, b, c, d, e, f];
   }
 
-  function drawTri(ctx, img, s0, s1, s2, d0, d1, d2, grow = 0.7) {
+  function drawTri(ctx, img, s0, s1, s2, d0, d1, d2, grow = 1.3) {
     const m = affine(s0, s1, s2, d0, d1, d2);
     if (!m) return;
     const cx = (d0.x + d1.x + d2.x) / 3;
@@ -464,13 +455,13 @@ export async function runFaceScan(root, canonicalName, api) {
   const area2 = (A, B, C) => (B.x - A.x) * (C.y - A.y) - (B.y - A.y) * (C.x - A.x);
 
   /** Triangle indices that are front-facing (not back-facing) for projected points Q, far to near. */
-  function frontTrianglesFarToNear(Q, mirrored) {
+  function frontTrianglesFarToNear(Q, mirrored, backFacing = false) {
     const list = [];
     for (let t = 0; t < tris.length; t++) {
       const [a, b, c] = tris[t];
       const ar = area2(Q[a], Q[b], Q[c]);
       if (Math.abs(ar) < 1e-6) continue;
-      if (Math.sign(ar) !== (mirrored ? -front[t] : front[t])) continue; // back-facing: hidden behind the face
+      if ((Math.sign(ar) !== (mirrored ? -front[t] : front[t])) !== backFacing) continue; // back-facing ones are hidden behind the face (or, with backFacing, the only ones returned)
       list.push([t, (Q[a].z + Q[b].z + Q[c].z) / 3]);
     }
     list.sort((u, v) => v[1] - u[1]); // MediaPipe: smaller z = nearer, so larger z is drawn first
@@ -1241,6 +1232,12 @@ export async function runFaceScan(root, canonicalName, api) {
           canonSk = k;
         }
       }
+      // Under everything: the triangles that face away (inside of the nostrils, far side of the nose). Seen at an angle they would otherwise
+      // leave a black hole in the face; the front-facing triangles are drawn over them.
+      for (const t of frontTrianglesFarToNear(D, true, true)) {
+        const [a, b, c] = tris[t];
+        if (useSkin && triCov[t] > 50) drawTri(g2, liveImg, canonS[a], canonS[b], canonS[c], D[a], D[b], D[c]);
+      }
       for (const t of order) {
         const [a, b, c] = tris[t];
         if (useSkin) {
@@ -1283,10 +1280,35 @@ export async function runFaceScan(root, canonicalName, api) {
 
   /** Tell the user which part of the face still has no skin painted on it, and how to bring it to the camera. */
   let lastTipAt = 0;
+  /** What to do to clear the circle on the square you are in: the biggest thing holding its photo quality down right now. */
+  function cellAdvice() {
+    const i = activeCell;
+    if (i < 0) return "";
+    const s = slots[i];
+    if (cellPct(i) >= 1) return "This cell is at 100%.";
+    if (!s) return "This square has no photo yet. Hold your head right here, still and facing the camera, for a second.";
+    const lp = liveParts || s.parts;
+    const gains = [  // only things you can actually act on: where inside a square you are is too fine to steer
+      ["size", 0.4 * (1 - lp.size)],
+      ["stab", 0.26 * (1 - lp.stab)],
+      ["centre", 0.34 * (1 - lp.centre)],
+    ].sort((a, b) => b[1] - a[1]);
+    const [kind, gain] = gains[0];
+    if (gain < 0.02) return "Stay here and hold perfectly still: this square improves on its own as better frames come in.";
+    if (kind === "size") return `Your face is only ${Math.round(lp.faceW ?? 0)} px wide: lean a little closer to the camera (or add light), then hold still.`;
+    if (kind === "stab") return "Hold still for half a second: movement is blurring the photo for this square.";
+    return "Keep your face in the middle of the camera view, then hold still.";
+  }
+
   function updateTip() {
     const now = performance.now();
     if (now - lastTipAt < 600) return;
     lastTipAt = now;
+    const adv = cellAdvice();
+    if (adv) {
+      tipEl.textContent = adv;
+      return;
+    }
     if (!tris || !canon || !acc || !baseline.ready) {
       tipEl.textContent = "";
       return;
@@ -1309,6 +1331,12 @@ export async function runFaceScan(root, canonicalName, api) {
       else if (x < cx - 0.16 * span) right++;
       if (y < cy - 0.2 * span) top++;
       else if (y > cy + 0.2 * span) bottom++;
+    }
+    // The server's blended skin map is the real measure of what is painted. When it says the skin is (nearly) all mapped, the few
+    // triangles left over here are ones no head angle can reach (under the jaw, edge of the neck): do not keep telling you to chase them.
+    if (stitchCoverage != null && stitchCoverage >= 97) {
+      tipEl.textContent = "Skin is fully mapped.";
+      return;
     }
     const need = Math.max(4, total * 0.04);
     const opts = [
@@ -1392,12 +1420,13 @@ export async function runFaceScan(root, canonicalName, api) {
         baseline.n = 0;
         baseline.sy = 0;
         baseline.sp = 0;
+        baseline.lmSum = null;
         showStatus("Centering…");
         drawModel();
         return;
       }
       if (Math.abs(symOf(lm)) > 0.05) {
-        baseline.n = 0; baseline.sy = 0; baseline.sp = 0;
+        baseline.n = 0; baseline.sy = 0; baseline.sp = 0; baseline.lmSum = null;
         showStatus("Look straight at the camera and hold still…");
         drawModel();
         return;
@@ -1405,6 +1434,8 @@ export async function runFaceScan(root, canonicalName, api) {
       baseline.sy += rawYaw;
       baseline.sp += rawPitch;
       baseline.n += 1;
+      if (!baseline.lmSum || baseline.lmSum.length !== lm.length) baseline.lmSum = lm.map(() => [0, 0, 0]);
+      lm.forEach((q, i) => { baseline.lmSum[i][0] += q.x; baseline.lmSum[i][1] += q.y; baseline.lmSum[i][2] += q.z; });
       showStatus(`Calibrating ${baseline.n}/${BASELINE_FRAMES} — look straight at the camera`);
       if (baseline.n >= BASELINE_FRAMES) {
         baseline.yaw = baseline.sy / baseline.n;
@@ -1412,7 +1443,9 @@ export async function runFaceScan(root, canonicalName, api) {
         baseline.ready = true;
         frontal = { jpeg: framing?.captureFramedJpeg?.(0.95, FRONTAL_PX, SCAN_WIDE) ?? null };
         frontalAspect = (video.videoWidth || 16) / (video.videoHeight || 9);
-        frontalLm = lm.map((q) => [q.x, q.y, q.z]); // the front-facing 3D landmarks (for the 3D model export)
+        // The front-facing 3D landmarks for the 3D model: the AVERAGE over all the calibration frames, so the model's resting shape has no
+        // single-frame jitter in it. (The skin layout below still comes from the last frame, which is the one the first photo was taken from.)
+        frontalLm = baseline.lmSum.map((q) => q.map((v) => v / baseline.n));
         setCanon(lm, frontalAspect);
         startStitch(lm).then(() => sendStitch(lm));
         framing?.lockFrame?.();
@@ -1449,7 +1482,9 @@ export async function runFaceScan(root, canonicalName, api) {
     if (pitch > 0 && pitch < 45) reach.up = Math.max(reach.up, pitch);
     if (pitch < 0 && pitch > -45) reach.down = Math.max(reach.down, -pitch);
     const clampN = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-    const yawS = yaw * (36 / clampN(reach.yaw * 0.75, 12, 36));
+    // The grid is stretched to fit how far YOU can turn, but never so much that a small turn reaches the outer squares: the outer column
+    // needs at least ~30 degrees of real turn (it used to be as little as ~18), so the sides of the head really get photographed.
+    const yawS = yaw * (40 / clampN(reach.yaw * 0.9, 30, 40));
     const pitchS = pitch >= 0 ? pitch * (16 / clampN(reach.up * 0.7, 4, 16)) : pitch * (16 / clampN(reach.down * 0.7, 4, 16));
     const { index, dist } = nearestCell(yawS, pitchS);
     activeCell = index;
@@ -1493,10 +1528,10 @@ export async function runFaceScan(root, canonicalName, api) {
       drawModel();
     }
     updateTip();
-    const here = slots[index] ? Math.round(100 * Math.min(1, steep(slots[index].quality / percentile90(slots.filter(Boolean).map((x) => x.quality))))) : 0;
+    const here = Math.floor(100 * cellPct(index)); // fixed scale: never drops because another square got better
     statusMsg = diag.last === "painting" ? "Scanning" : diag.last;
     liveRows = [
-      ["Square", `row ${CELLS[index].r + 1}, column ${CELLS[index].c + 1}` + (slots[index] ? ` (${here}% of your best)` : " (no photo yet)")],
+      ["Square", `row ${CELLS[index].r + 1}, column ${CELLS[index].c + 1}` + (slots[index] ? ` (${here}% quality)` : " (no photo yet)")],
       ["Head", `${yaw >= 0 ? "right" : "left"} ${Math.abs(yaw).toFixed(0)}° · ${pitch >= 0 ? "up" : "down"} ${Math.abs(pitch).toFixed(0)}°`],
       ["Your range", `sideways ±${reach.yaw.toFixed(0)}° · up ${reach.up.toFixed(0)}° · down ${reach.down.toFixed(0)}°`],
       ["Skin painted", `${diag.painted} patches (${diag.rejected} colour-matched)`],
@@ -1517,7 +1552,7 @@ export async function runFaceScan(root, canonicalName, api) {
       const centrePart = Math.max(0, Math.min(1, 1 - Math.hypot(1 - box.cx - 0.5, box.cy - 0.5) * 1.4));
       const q = Math.max(0.05, (0.34 * centrePart + 0.4 * sizePart + 0.26 * stabPart) * (1 - 0.25 * Math.min(1, dist)));
       flashCell(index);
-      if (!slots[index] || q > slots[index].quality + 0.002) void sendStitch(lm);
+      if ((!slots[index] || q > slots[index].quality + 0.002) && stabPart > 0.6) void sendStitch(lm); // never send a frame taken while moving
       grab(index, q, yaw, pitch, { size: sizePart, stab: stabPart, centre: centrePart, faceW: faceFrac });
     }
   }
@@ -1559,12 +1594,15 @@ export async function runFaceScan(root, canonicalName, api) {
       video.srcObject = stream;
       await video.play();
     }
-    const { createCameraFraming } = await import("/static/camera-framing.js?v=33");
+    const { createCameraFraming } = await import("/static/camera-framing.js?v=42");
     framing = await createCameraFraming(video, videoWrap, null, {
       mode: "face",
       steadyFrame: false,
       scanMode: true,
       fillWide: SCAN_WIDE,
+      persistKey: "scan", // remember the framing that worked: the next scan starts with it
+      aimY: 0.58, // the face points run brow to chin, so the face sits a little below the middle to leave room for hair above it
+      targetFrac: 0.5, // the face fills about this much of the camera window: centred and cropped in, like the mask beside it
       onLandmarks: onFrame,
       onStatus: (msg) => {
         showStatus(msg);
@@ -1572,10 +1610,10 @@ export async function runFaceScan(root, canonicalName, api) {
     });
     // Show the whole area that gets saved (SCAN_WIDE x the circle), not just its centre: same box size, wider view.
     const panEl = videoWrap.querySelector(".scan-video-pan");
-    if (panEl && !panEl.parentElement.classList.contains("scan-wide-view")) {
+    if (DISPLAY_WIDE > 1 && panEl && !panEl.parentElement.classList.contains("scan-wide-view")) {
       const wideView = document.createElement("div");
       wideView.className = "scan-wide-view";
-      wideView.style.cssText = `position:absolute;inset:0;transform:scale(${1 / SCAN_WIDE});transform-origin:center center`;
+      wideView.style.cssText = `position:absolute;inset:0;transform:scale(${1 / DISPLAY_WIDE});transform-origin:center center`;
       panEl.parentElement.insertBefore(wideView, panEl);
       wideView.appendChild(panEl);
     }
@@ -1650,7 +1688,7 @@ export async function runFaceScan(root, canonicalName, api) {
     const hb = document.getElementById("logout-btn");
     if (hb) hb.style.display = "none"; // the scan has its own Cancel and Save
     btnDone.onclick = () => void finishScan();
-    wrap.querySelector("#scan-recenter").onclick = () => { recenter = { n: 0, sy: 0, sp: 0 }; };
+    if (recenterBtn) recenterBtn.onclick = () => { recenter = { n: 0, sy: 0, sp: 0 }; };
     (async () => {
       try {
         await startCamera();

@@ -1,16 +1,26 @@
-<!doctype html>
+<!DOCTYPE html>
 <html lang="en">
-<head>
-  <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Generate 3D Mesh</title>
-  <link rel="stylesheet" href="/static/styles.css?v=1" />
-</head>
-<body class="cinematic">
-  <div class="app">
-    <header class="app-header"><h1>Generate 3D Mesh</h1><button type="button" id="logout-btn" hidden></button></header>
-    <main id="root" class="screen-root"></main>
-  </div>
-  <script type="module" src="/static/app.js?v=1"></script>
-</body>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Generate 3D Mesh</title>
+    <link rel="stylesheet" href="/static/styles.css?v=21" />
+  </head>
+  <body>
+    <div class="app">
+      <header class="header">
+        <h1>Generate 3D Mesh</h1>
+        <p class="subtitle" id="phase-label"></p>
+        <button type="button" class="btn-ghost" id="logout-btn" hidden>Change profile</button>
+      </header>
+
+      <main id="root" class="screen-root" aria-live="polite"></main>
+
+      <footer class="footer">
+        <span id="status-hint"></span>
+      </footer>
+      <div class="credit"><span id="hw-mode"></span><span id="credit-text">Jeff Molofee (NeHe) 2026</span></div>
+    </div>
+    <script src="/static/app.js?v=65" type="module"></script>
+  </body>
 </html>

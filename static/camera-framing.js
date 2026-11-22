@@ -80,6 +80,8 @@ export async function createCameraFraming(video, container, hintEl, options = {}
   let reiniting = false;
   let locked = false;
   let settledFrames = 0;
+  let goodRun = 0; // consecutive frames that were properly centred
+  let scanFrames = 0; // frames spent trying to centre in scan mode
   let lastVideoTime = -1;
   let lastTs = 0;
   // Some browsers/cameras make MediaPipe throw "index out of bounds" when given the raw <video>. After the first such error
@@ -203,7 +205,7 @@ export async function createCameraFraming(video, container, hintEl, options = {}
 
     if (!lm) {
       faceDetected = false;
-      settledFrames = 0;
+      if (!locked) settledFrames = 0; // once the view is locked, losing the face for a moment must not undo it
       if (onLandmarks) {
         try {
           onLandmarks(null, null);
@@ -256,13 +258,6 @@ export async function createCameraFraming(video, container, hintEl, options = {}
       if (box.w > 0.4) scaleTarget = Math.min(scaleTarget, 0.95);
       scaleTarget = Math.min(1.18, Math.max(0.92, scaleTarget));
     }
-    if (scanMode && fillWide) {
-      // Fixed view: the whole scene is shown and saved, so nothing follows or zooms on the face.
-      applyTransform(0, 0, 0); // clamped up to the smallest zoom that fills the box
-      settledFrames++; // "settled" = a face has been seen steadily
-      rafId = requestAnimationFrame(tick);
-      return;
-    }
     if (scanMode) {
       // Closed loop: measure where the face ACTUALLY is in the circle (same
       // geometry the JPEG capture uses), then nudge pan/zoom to fix what's left.
@@ -270,15 +265,32 @@ export async function createCameraFraming(video, container, hintEl, options = {}
       const fx = g.centerX - (-g.drawW / 2 + ((box.cx * g.vw - g.sx) / g.sw) * g.drawW);
       const fy = g.centerY + (-g.drawH / 2 + ((box.cy * g.vh - g.sy) / g.sh) * g.drawH);
       const offX = fx - g.cw / 2; // + = face is right of the circle center
-      const offY = fy - g.ch / 2; // + = face is below it
+      const offY = fy - g.ch * (options.aimY ?? 0.5); // + = face is below where it should be (aimY: 0.5 = the middle; larger leaves headroom for hair)
       const faceFrac = ((box.w * g.vw) / g.sw) * g.drawW / g.cw; // face width / circle width
-      const TARGET_FRAC = 0.48; // leave margin around the face in saved scan photos
+      const TARGET_FRAC = options.targetFrac ?? 0.48; // how much of the window the face fills (the saved photos still include extra margin around it)
       const newScale = Math.min(3, Math.max(0.9, prev.scale * (TARGET_FRAC / Math.max(faceFrac, 0.05))));
-      const scale2 = prev.scale * (1 - smooth) + newScale * smooth;
+      let scale2 = prev.scale * (1 - smooth) + newScale * smooth;
+      if (fillWide) {
+        // The picture may only slide as far as the zoom leaves spare room (so no empty edges show). A face that is off to one side
+        // needs that room: zoom in just enough to be able to centre it, instead of getting stuck.
+        const ov = mode === "body" ? 1.2 : 1.22;
+        // The offset of the face from the middle grows in proportion to the zoom, so measure it in picture units (offset / zoom) and solve for the
+        // zoom that leaves exactly enough room: room = (ov * zoom - fillWide) / 2 must cover the offset (ov / 2 - d) ... which gives zoom >= fillWide / (ov - 2d).
+        const d = Math.max(Math.abs(prev.tx - offX) / g.cw, Math.abs(prev.ty - offY) / g.ch) / Math.max(prev.scale, 0.5); // the TOTAL shift needed (already applied + what is left), not just what is left
+        const den = ov - 2 * 1.1 * d;
+        const need = den > 0.2 ? fillWide / den : 3;
+        scale2 = Math.min(3, Math.max(scale2, need));
+      }
       applyTransform(scale2, prev.tx - offX * smooth, prev.ty - offY * smooth);
       const centered2 = Math.hypot(offX / g.cw, offY / g.ch) < 0.03;
-      const zoomed2 = Math.abs(faceFrac - TARGET_FRAC) < 0.06;
-      settledFrames = centered2 && zoomed2 ? settledFrames + 1 : 0;
+      const zoomed2 = Math.abs(faceFrac - TARGET_FRAC) < 0.06 || (fillWide && lastTransform.scale <= fillWide / (mode === "body" ? 1.2 : 1.22) + 0.01 && faceFrac > TARGET_FRAC); // at the widest allowed view already
+      scanFrames++;
+      // "Properly centred" = centred, and the face at least about the target size (it may be bigger: a head high in the picture needs extra zoom for room).
+      const good = centered2 && faceFrac > TARGET_FRAC - 0.06 && faceFrac < 0.95;
+      goodRun = good ? goodRun + 1 : 0;
+      if (goodRun >= 12) saveDefault(); // 12 steady frames properly centred: this framing becomes the default for next time
+      settledFrames = good || scanFrames > 150 ? settledFrames + 1 : 0; // never hang on "Centering": after ~3 s, carry on (but that is not saved)
+      if (settledFrames >= 12) locked = true; // centred once, at the start: from here the view never moves again, whatever your head does
       rafId = requestAnimationFrame(tick);
       return;
     }
@@ -304,7 +316,19 @@ export async function createCameraFraming(video, container, hintEl, options = {}
     rafId = requestAnimationFrame(tick);
   }
 
+  // The framing worked out for this camera (zoom and shift) is remembered, so the next scan starts centred straight away.
+  const DEFAULT_KEY = options.persistKey ? `cameraFraming:${options.persistKey}` : "";
+  function saveDefault() {
+    if (!DEFAULT_KEY || locked || !container.clientWidth) return;
+    try { localStorage.setItem(DEFAULT_KEY, JSON.stringify({ ...lastTransform, cw: container.clientWidth, ch: container.clientHeight })); } catch { /* storage unavailable */ }
+  }
   layoutVideo();
+  if (DEFAULT_KEY) {
+    try {
+      const s = JSON.parse(localStorage.getItem(DEFAULT_KEY) || "null");
+      if (s && s.scale > 0 && s.cw && s.ch && container.clientWidth) applyTransform(s.scale, (s.tx * container.clientWidth) / s.cw, (s.ty * container.clientHeight) / s.ch);
+    } catch { /* ignore a bad saved value */ }
+  }
   const hasMl = await initLandmarker();
   const onResize = () => layoutVideo();
   window.addEventListener("resize", onResize);

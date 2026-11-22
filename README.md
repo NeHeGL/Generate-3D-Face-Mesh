@@ -8,12 +8,15 @@ photos into one seamless skin texture. **Export 3D model** then writes an OBJ mo
 
 Everything for a person goes in `output/<name>/`:
 
+Saving a scan builds the whole `mesh/` folder automatically.
+
 | File | What |
 |---|---|
-| `photos/` + `photos.json` | the best photo for each pose, with its measured head angle |
-| `skin_atlas.json` | mesh layout: landmarks, triangles, texture coordinates, front-facing 3D landmarks |
-| `skin_stitched.png` | the blended 2048 px skin texture |
-| `mesh.obj`, `mesh.mtl` | the face model (open in Blender, MeshLab, Windows 3D Viewer) |
+| `profile.json` | the name as typed (the folder is the lowercase name: Jeff Molofee → `jeff_molofee`) |
+| `photos/` | the best photo for each pose, with `photos.json` (measured head angle for each) |
+| `mesh/mesh.obj`, `mesh.mtl`, `skin.png` | the 3D model and its skin texture: everything a 3D tool needs |
+| `mesh/mesh.json` | the same mesh as plain data, used by the in-app viewer |
+| `mesh/skin_atlas.json`, `preview.jpg` | the layout the model is built from, and a small picture of the skin |
 
 ## Run
 
@@ -23,5 +26,4 @@ creates a Python environment and installs the few packages in `requirements.txt`
 
 ## Notes
 
-This is the face scan from Avatar Studio, moved out into its own project. Avatar Studio now only needs a single good photo.
 The 3D model export is new and untested against a live scan: it uses the 468 face landmarks (with depth) from the front-facing frame.

@@ -2,3 +2,8 @@
 __pycache__/
 output/
 *.pyc
+dist/
+build/
+*.spec
+graphify-out/
+mesh-app.log
